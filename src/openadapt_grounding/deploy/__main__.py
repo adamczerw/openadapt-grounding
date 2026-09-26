@@ -10,6 +10,9 @@ Usage:
     python -m openadapt_grounding.deploy build   # Build Docker image
     python -m openadapt_grounding.deploy run     # Start container
     python -m openadapt_grounding.deploy test    # Test endpoint
+    python -m openadapt_grounding.deploy secure  # Remove public API port (use tunnel instead)
+    python -m openadapt_grounding.deploy tunnel  # Open SSH tunnel and print local URL
+    python -m openadapt_grounding.deploy pause   # Stop (not terminate) instance
 """
 
 from openadapt_grounding.deploy.deploy import main

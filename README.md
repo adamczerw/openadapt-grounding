@@ -165,8 +165,27 @@ cp .env.example .env
 # Deploy to EC2 (g6.xlarge with L4 GPU)
 uv run python -m openadapt_grounding.deploy start
 
-# Stop when done (terminates instance)
+# Open an SSH tunnel; the API is then available at http://localhost:8000
+uv run python -m openadapt_grounding.deploy tunnel
+
+# Pause when done (stops the instance; `start` resumes it and reuses the built image)
+uv run python -m openadapt_grounding.deploy pause
+
+# Or tear everything down (terminates instance)
 uv run python -m openadapt_grounding.deploy stop
+```
+
+The security group only opens SSH (port 22); the API port is never exposed publicly and is reached through the SSH tunnel. For deployments created before this change, run `deploy secure` once to close the public API port. The EC2 key pair (`<PROJECT_NAME>.pem`) is written next to your `.env` file.
+
+To use the tunnel from Python:
+
+```python
+from openadapt_grounding import OmniParserClient
+from openadapt_grounding.deploy import Deploy
+
+with Deploy.tunnel() as url:  # opens the tunnel, closes it on exit
+    client = OmniParserClient(url)
+    ...
 ```
 
 ### Monitor Deployment
@@ -174,7 +193,9 @@ uv run python -m openadapt_grounding.deploy stop
 ```bash
 # Check instance and server status
 $ uv run python -m openadapt_grounding.deploy status
-Instance: i-0f57529053cb507ca | State: running | URL: http://98.92.234.13:8000
+Instance: i-0f57529053cb507ca | State: running | IP: 98.92.234.13
+SSH tunnel: ssh -L 8000:localhost:8000 -i /path/to/omniparser.pem -N -o StrictHostKeyChecking=no ubuntu@98.92.234.13
+Then use:   http://localhost:8000
 Auto-shutdown: Enabled (60 min timeout)
 
 # Show container status
@@ -190,7 +211,7 @@ image size: (1200, 779)
 len(filtered_boxes): 160 124
 time: 4.438266754150391
 
-# Test endpoint with synthetic image
+# Test endpoint with synthetic image (opens a temporary SSH tunnel)
 $ uv run python -m openadapt_grounding.deploy test
 Server is healthy!
 Sending test image to server...
@@ -203,10 +224,13 @@ Found 5 elements:
 ### Other Commands
 
 ```bash
-uv run python -m openadapt_grounding.deploy build   # Rebuild Docker image
+uv run python -m openadapt_grounding.deploy build   # Rebuild Docker image (needed after Dockerfile changes)
 uv run python -m openadapt_grounding.deploy run     # Start container
 uv run python -m openadapt_grounding.deploy ssh     # SSH into instance
+uv run python -m openadapt_grounding.deploy secure  # Close the public API port on an existing deployment
 ```
+
+`start` skips cloning OmniParser and building the image when the `omniparser` image already exists on the instance, so restarting a paused instance is fast. Use `build` to force a rebuild.
 
 ### Test Results
 
@@ -234,7 +258,7 @@ from openadapt_grounding import OmniParserClient, collect_frames
 from PIL import Image
 
 # Connect to deployed server
-client = OmniParserClient("http://<server-ip>:8000")
+client = OmniParserClient("http://localhost:8000")  # via `deploy tunnel`
 
 # Take a screenshot
 screenshot = Image.open("screen.png")
@@ -251,7 +275,7 @@ print(f"Found {len(registry)} stable elements")
 ```python
 from openadapt_grounding import OmniParserClient, analyze_stability
 
-client = OmniParserClient("http://<server-ip>:8000")
+client = OmniParserClient("http://localhost:8000")  # via `deploy tunnel`
 stats = analyze_stability(client, screenshot, num_frames=10)
 
 print(f"Average stability: {stats['avg_stability']:.0%}")
