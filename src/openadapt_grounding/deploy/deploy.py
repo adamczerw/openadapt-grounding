@@ -27,11 +27,40 @@ Usage:
 import io
 import json
 import os
+import re
 import subprocess
 import time
 import zipfile
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Optional, Tuple
+
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_DOCKER_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z ")
+
+
+def _localize_timestamps(output: str, tz: Optional[tzinfo] = None) -> str:
+    """Replace UTC docker --timestamps values with local time.
+
+    Args:
+        output: Docker log output produced with ``--timestamps``.
+        tz: Target timezone (default: this machine's local timezone).
+    """
+    lines = []
+    for line in output.splitlines():
+        m = _DOCKER_TS.match(line)
+        if m:
+            # Docker trims trailing zeros and emits up to 9 fractional digits;
+            # fromisoformat (Python 3.10) needs exactly 6.
+            fraction = (m.group(2) or ".")[1:7].ljust(6, "0")
+            ts_str = f"{m.group(1)}.{fraction}+00:00"
+            try:
+                dt = datetime.fromisoformat(ts_str).astimezone(tz)
+                line = dt.strftime("%Y-%m-%d %H:%M:%S %z") + " " + line[m.end():]
+            except ValueError:
+                pass
+        lines.append(line)
+    return "\n".join(lines)
 
 try:
     import boto3
@@ -201,6 +230,7 @@ def deploy_ec2_instance(
     # Create new key pair
     try:
         if os.path.exists(config.AWS_EC2_KEY_PATH):
+            os.chmod(config.AWS_EC2_KEY_PATH, 0o600)
             os.remove(config.AWS_EC2_KEY_PATH)
 
         try:
@@ -270,6 +300,7 @@ def configure_ec2_instance(
             ssh_client.connect(
                 hostname=instance_ip, username=config.AWS_EC2_USER, pkey=key
             )
+            ssh_client.get_transport().set_keepalive(30)
             break
         except Exception as e:
             ssh_retries += 1
@@ -293,8 +324,15 @@ def configure_ec2_instance(
         "sudo systemctl start docker",
         "sudo systemctl enable docker",
         "sudo usermod -a -G docker ${USER}",
-        "sudo docker system prune -af --volumes",
+        # Install NVIDIA Container Toolkit for GPU support
+        "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+        'curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed \'s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g\' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list',
+        "sudo apt-get update",
+        "sudo apt-get install -y nvidia-container-toolkit",
+        "sudo nvidia-ctk runtime configure --runtime=docker",
+        "sudo systemctl restart docker",
         f"sudo docker rm -f {config.CONTAINER_NAME} || true",
+        "echo \"Docker images on instance: $(sudo docker images | tail -n +2 | wc -l)\" && sudo docker images",
     ]
 
     for command in commands:
@@ -305,6 +343,9 @@ def configure_ec2_instance(
             exit_status = stdout.channel.recv_exit_status()
 
             if exit_status == 0:
+                output = stdout.read().decode()
+                if output.strip():
+                    print(output)
                 break
             else:
                 error_message = stderr.read().decode()
@@ -320,29 +361,45 @@ def configure_ec2_instance(
     return instance_id, instance_ip
 
 
-def execute_command(ssh_client: paramiko.SSHClient, command: str) -> None:
-    """Execute command and stream output."""
-    print(f"Executing: {command[:80]}...")
-    stdin, stdout, stderr = ssh_client.exec_command(
-        command, timeout=config.COMMAND_TIMEOUT
-    )
+def execute_command(ssh_client: paramiko.SSHClient, command: str, idle_timeout: int = 3600) -> None:
+    """Execute command and stream output with heartbeat and idle timeout."""
+    print(f"Executing: {command[:80]}...", flush=True)
+    # get_pty=True allocates a pseudo-terminal on the remote side, which forces
+    # programs (including docker build) to use line-buffering instead of
+    # block-buffering — so output appears in real time rather than at the end.
+    # With a pty, stderr is merged into stdout as it would be in a real terminal.
+    stdin, stdout, stderr = ssh_client.exec_command(command, timeout=None, get_pty=True)
+
+    last_output = time.time()
+    last_heartbeat = time.time()
+    heartbeat_interval = 60
 
     while not stdout.channel.exit_status_ready():
         if stdout.channel.recv_ready():
-            line = stdout.channel.recv(1024).decode("utf-8", errors="replace")
-            if line.strip():
-                print(line.strip())
+            chunk = stdout.channel.recv(65535).decode("utf-8", errors="replace")
+            chunk = _ANSI_ESCAPE.sub("", chunk).replace("\r\n", "\n").replace("\r", "\n")
+            if chunk:
+                print(chunk, end="", flush=True)
+                last_output = time.time()
+                last_heartbeat = time.time()
+
+        now = time.time()
+        if now - last_output > idle_timeout:
+            raise RuntimeError(f"Command idle for {idle_timeout}s with no output, aborting")
+        if now - last_heartbeat > heartbeat_interval:
+            print(f"[still running, no output for {int(now - last_output)}s...]", flush=True)
+            last_heartbeat = now
+
+        time.sleep(0.1)
 
     exit_status = stdout.channel.recv_exit_status()
 
     remaining = stdout.read().decode("utf-8", errors="replace")
-    if remaining.strip():
-        print(remaining.strip())
+    remaining = _ANSI_ESCAPE.sub("", remaining).replace("\r\n", "\n").replace("\r", "\n")
+    if remaining:
+        print(remaining, end="", flush=True)
 
     if exit_status != 0:
-        error = stderr.read().decode("utf-8", errors="replace")
-        if error.strip():
-            print(f"Error: {error.strip()}")
         raise RuntimeError(f"Command failed with status {exit_status}")
 
 
@@ -665,11 +722,10 @@ class Deploy:
                     pkey=key,
                     timeout=30,
                 )
+                ssh_client.get_transport().set_keepalive(30)
 
                 setup_commands = [
-                    "rm -rf OmniParser",
-                    f"git clone {config.REPO_URL}",
-                    "cp Dockerfile .dockerignore OmniParser/",
+                    f"sudo docker image inspect {config.PROJECT_NAME} > /dev/null 2>&1 || (rm -rf OmniParser && git clone {config.REPO_URL} && cp Dockerfile .dockerignore OmniParser/)",
                 ]
 
                 for cmd in setup_commands:
@@ -677,8 +733,7 @@ class Deploy:
 
                 docker_commands = [
                     f"sudo docker rm -f {config.CONTAINER_NAME} || true",
-                    f"sudo docker rmi {config.PROJECT_NAME} || true",
-                    f"cd OmniParser && sudo docker build --progress=plain -t {config.PROJECT_NAME} .",
+                    f"sudo docker image inspect {config.PROJECT_NAME} > /dev/null 2>&1 || (cd OmniParser && sudo docker build --progress=plain -t {config.PROJECT_NAME} .)",
                     f"sudo docker run -d -p {config.PORT}:{config.PORT} --gpus all --name {config.CONTAINER_NAME} {config.PROJECT_NAME}",
                 ]
 
@@ -777,11 +832,11 @@ class Deploy:
             subprocess.run(
                 [
                     "ssh",
+                    "-tt",
                     "-o", "StrictHostKeyChecking=no",
                     "-o", "UserKnownHostsFile=/dev/null",
                     "-i", config.AWS_EC2_KEY_PATH,
                     f"{config.AWS_EC2_USER}@{ip}",
-                    "-t", "-tt",
                     "bash --login -c 'exit'",
                 ],
                 check=False,
@@ -821,6 +876,26 @@ class Deploy:
                 print(f"Error deleting security group: {e}")
 
     @staticmethod
+    def pause() -> None:
+        """Stop (but don't terminate) the running instance."""
+        ec2_client = boto3.client("ec2", region_name=config.AWS_REGION)
+        ec2 = boto3.resource("ec2", region_name=config.AWS_REGION)
+        instances = ec2.instances.filter(
+            Filters=[
+                {"Name": "tag:Name", "Values": [config.PROJECT_NAME]},
+                {"Name": "instance-state-name", "Values": ["running"]},
+            ]
+        )
+        instance = next(iter(instances), None)
+        if not instance:
+            print("No running instance found")
+            return
+        print(f"Stopping: {instance.id}")
+        ec2_client.stop_instances(InstanceIds=[instance.id])
+        instance.wait_until_stopped()
+        print(f"Stopped: {instance.id}")
+
+    @staticmethod
     def _get_instance_ip() -> Optional[str]:
         """Get public IP of running instance."""
         ec2 = boto3.resource("ec2", region_name=config.AWS_REGION)
@@ -856,6 +931,8 @@ class Deploy:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         if result.returncode != 0 and result.stderr:
@@ -871,10 +948,10 @@ class Deploy:
         """
         print(f"Fetching last {lines} lines of container logs...")
         output = Deploy._run_ssh_command(
-            f"sudo docker logs {config.CONTAINER_NAME} 2>&1 | tail -{lines}"
+            f"sudo docker logs --timestamps {config.CONTAINER_NAME} 2>&1 | tail -{lines}"
         )
         if output:
-            print(output)
+            print(_localize_timestamps(output))
 
     @staticmethod
     def ps() -> None:
