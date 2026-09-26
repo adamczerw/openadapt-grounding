@@ -161,7 +161,7 @@ class OmniParserClient:
                     bounds=(x, y, w, h),
                     text=text,
                     element_type=element_type,
-                    confidence=item.get("confidence", 1.0),
+                    confidence=item.get("confidence"),
                 )
             )
 
