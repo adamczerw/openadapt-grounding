@@ -1,6 +1,36 @@
 # CHANGELOG
 
 
+## Unreleased
+
+### Bug Fixes
+
+- Don't invent a confidence for OmniParser elements
+  ([`7691834`](https://github.com/adamczerw/openadapt-grounding/commit/7691834e9d012ddea58233021129d9f17341a388))
+
+- Resolve deploy .env and EC2 key paths independently of cwd
+  ([`93f3531`](https://github.com/adamczerw/openadapt-grounding/commit/93f3531136390971fdd63552b343d359141d69b6))
+
+### Build System
+
+- Move the OmniParser image to CUDA 13 and a prebuilt flash-attn
+  ([`2609613`](https://github.com/adamczerw/openadapt-grounding/commit/260961371708debe213b320e39982c95675d1098))
+
+### Features
+
+- Reach the OmniParser API only through an SSH tunnel
+  ([`7416d71`](https://github.com/adamczerw/openadapt-grounding/commit/7416d71313a86ce7315f30a23f897587f5190a67))
+
+The security group only opens SSH; new `tunnel` and `secure` commands, and `start`, `status` and
+  `test` use the tunnel.
+
+- Faster, observable OmniParser/UI-TARS deploys and a pause command
+  ([`68342fb`](https://github.com/adamczerw/openadapt-grounding/commit/68342fb37db16ffd1a71869493ece58b08bee5bd))
+
+Live streamed build output, Docker image reuse, NVIDIA Container Toolkit setup, and `pause` to stop
+  the instance without terminating it.
+
+
 ## v0.1.2 (2026-01-29)
 
 ### Bug Fixes

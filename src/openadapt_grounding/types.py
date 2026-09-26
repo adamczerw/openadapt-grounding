@@ -14,7 +14,7 @@ class Element:
     bounds: Bounds  # Normalized (x, y, w, h)
     text: Optional[str] = None
     element_type: str = "unknown"
-    confidence: float = 1.0
+    confidence: Optional[float] = 1.0  # None if the detector reports no score
 
     @property
     def center(self) -> Tuple[float, float]:

@@ -1,5 +1,6 @@
 """Configuration settings for OmniParser deployment."""
 
+import os
 from pathlib import Path
 
 try:
@@ -10,26 +11,43 @@ except ImportError:
     )
 
 
+_env_file_cache: "Path | None | bool" = False  # False = not yet searched
+
+
 def _find_env_file() -> Path | None:
     """Find .env file by walking up from cwd or package directory."""
+    global _env_file_cache
+    if _env_file_cache is not False:
+        return _env_file_cache  # type: ignore[return-value]
+
     # Try cwd first
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         env_path = parent / ".env"
         if env_path.exists():
+            print(f"[config] Using .env: {env_path}")
+            _env_file_cache = env_path
             return env_path
         # Stop at common project boundaries
         if (parent / ".git").exists() or (parent / "pyproject.toml").exists():
-            if env_path.exists():
-                return env_path
             break
 
     # Fall back to package directory
     pkg_env = Path(__file__).parent.parent.parent.parent / ".env"
     if pkg_env.exists():
+        print(f"[config] Using .env (fallback): {pkg_env}")
+        _env_file_cache = pkg_env
         return pkg_env
 
+    print("[config] No .env file found")
+    _env_file_cache = None
     return None
+
+
+def _get_project_root() -> Path:
+    """Return the project root directory (where .env lives), or cwd as fallback."""
+    env = _find_env_file()
+    return env.parent if env else Path.cwd()
 
 
 class DeploySettings(BaseSettings):
@@ -74,7 +92,7 @@ class DeploySettings(BaseSettings):
 
     @property
     def AWS_EC2_KEY_PATH(self) -> str:
-        return f"./{self.AWS_EC2_KEY_NAME}.pem"
+        return str(_get_project_root() / f"{self.AWS_EC2_KEY_NAME}.pem")
 
     @property
     def AWS_EC2_SECURITY_GROUP(self) -> str:
@@ -126,7 +144,7 @@ class UITarsSettings(BaseSettings):
 
     @property
     def AWS_EC2_KEY_PATH(self) -> str:
-        return f"./{self.AWS_EC2_KEY_NAME}.pem"
+        return str(_get_project_root() / f"{self.AWS_EC2_KEY_NAME}.pem")
 
     @property
     def AWS_EC2_SECURITY_GROUP(self) -> str:
@@ -136,3 +154,11 @@ class UITarsSettings(BaseSettings):
 # Global settings instances
 settings = DeploySettings()
 uitars_settings = UITarsSettings()
+
+# Propagate credentials to os.environ so boto3 can find them
+if settings.AWS_ACCESS_KEY_ID:
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", settings.AWS_ACCESS_KEY_ID)
+if settings.AWS_SECRET_ACCESS_KEY:
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", settings.AWS_SECRET_ACCESS_KEY)
+if settings.AWS_REGION:
+    os.environ.setdefault("AWS_DEFAULT_REGION", settings.AWS_REGION)

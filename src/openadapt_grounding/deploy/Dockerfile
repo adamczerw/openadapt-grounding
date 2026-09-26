@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.3.1-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.3-devel-ubuntu22.04
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git-lfs \
@@ -36,11 +36,12 @@ WORKDIR /app/OmniParser
 RUN . /opt/conda/etc/profile.d/conda.sh && conda activate omni && \
     pip uninstall -y opencv-python opencv-python-headless && \
     pip install --no-cache-dir opencv-python-headless==4.8.1.78 && \
+    pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu130 && \
     pip install -r requirements.txt && \
     pip install huggingface_hub fastapi uvicorn && \
     pip install paddleocr==2.8.1 paddlepaddle==2.6.2 && \
     pip install transformers==4.44.2 && \
-    pip install flash-attn --no-build-isolation
+    pip install "https://github.com/adithyaxx/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 # Download V2 weights
 RUN . /opt/conda/etc/profile.d/conda.sh && conda activate omni && \
@@ -51,6 +52,9 @@ RUN . /opt/conda/etc/profile.d/conda.sh && conda activate omni && \
         huggingface-cli download microsoft/OmniParser-v2.0 --local-dir weights --repo-type model --include "$folder/*"; \
     done && \
     mv weights/icon_caption weights/icon_caption_florence
+
+# Disable uvicorn reload so EasyOCR initializes in the main process with GPU context
+RUN sed -i 's/reload=True/reload=False/' /app/OmniParser/omnitool/omniparserserver/omniparserserver.py
 
 # Pre-download EasyOCR model during build (PaddleOCR downloads at runtime)
 RUN . /opt/conda/etc/profile.d/conda.sh && conda activate omni && \

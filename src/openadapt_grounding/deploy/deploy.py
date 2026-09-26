@@ -21,17 +21,57 @@ Usage:
     python -m openadapt_grounding.deploy ps      # Show container status
     python -m openadapt_grounding.deploy build   # Build Docker image
     python -m openadapt_grounding.deploy run     # Start container
-    python -m openadapt_grounding.deploy test    # Test endpoint
+    python -m openadapt_grounding.deploy test    # Test endpoint (via SSH tunnel)
+    python -m openadapt_grounding.deploy secure  # Remove public API port (use tunnel instead)
+    python -m openadapt_grounding.deploy tunnel  # Open SSH tunnel and print local URL
+    python -m openadapt_grounding.deploy pause   # Stop (not terminate) instance
 """
 
 import io
 import json
 import os
+import re
+import socket
 import subprocess
 import time
 import zipfile
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Optional, Tuple
+
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_DOCKER_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z ")
+
+
+def _free_local_port() -> int:
+    """Return a currently unused localhost TCP port."""
+    with socket.socket() as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
+
+
+def _localize_timestamps(output: str, tz: Optional[tzinfo] = None) -> str:
+    """Replace UTC docker --timestamps values with local time.
+
+    Args:
+        output: Docker log output produced with ``--timestamps``.
+        tz: Target timezone (default: this machine's local timezone).
+    """
+    lines = []
+    for line in output.splitlines():
+        m = _DOCKER_TS.match(line)
+        if m:
+            # Docker trims trailing zeros and emits up to 9 fractional digits;
+            # fromisoformat (Python 3.10) needs exactly 6.
+            fraction = (m.group(2) or ".")[1:7].ljust(6, "0")
+            ts_str = f"{m.group(1)}.{fraction}+00:00"
+            try:
+                dt = datetime.fromisoformat(ts_str).astimezone(tz)
+                line = dt.strftime("%Y-%m-%d %H:%M:%S %z") + " " + line[m.end():]
+            except ValueError:
+                pass
+        lines.append(line)
+    return "\n".join(lines)
 
 try:
     import boto3
@@ -88,7 +128,7 @@ def get_or_create_security_group_id(
 ) -> Optional[str]:
     """Get existing security group or create a new one."""
     if ports is None:
-        ports = [22, config.PORT]
+        ports = [22]  # Only SSH — API port is accessed via SSH tunnel
 
     ec2 = boto3.client("ec2", region_name=config.AWS_REGION)
 
@@ -201,6 +241,7 @@ def deploy_ec2_instance(
     # Create new key pair
     try:
         if os.path.exists(config.AWS_EC2_KEY_PATH):
+            os.chmod(config.AWS_EC2_KEY_PATH, 0o600)
             os.remove(config.AWS_EC2_KEY_PATH)
 
         try:
@@ -270,6 +311,7 @@ def configure_ec2_instance(
             ssh_client.connect(
                 hostname=instance_ip, username=config.AWS_EC2_USER, pkey=key
             )
+            ssh_client.get_transport().set_keepalive(30)
             break
         except Exception as e:
             ssh_retries += 1
@@ -293,8 +335,15 @@ def configure_ec2_instance(
         "sudo systemctl start docker",
         "sudo systemctl enable docker",
         "sudo usermod -a -G docker ${USER}",
-        "sudo docker system prune -af --volumes",
+        # Install NVIDIA Container Toolkit for GPU support
+        "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+        'curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed \'s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g\' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list',
+        "sudo apt-get update",
+        "sudo apt-get install -y nvidia-container-toolkit",
+        "sudo nvidia-ctk runtime configure --runtime=docker",
+        "sudo systemctl restart docker",
         f"sudo docker rm -f {config.CONTAINER_NAME} || true",
+        "echo \"Docker images on instance: $(sudo docker images | tail -n +2 | wc -l)\" && sudo docker images",
     ]
 
     for command in commands:
@@ -305,6 +354,9 @@ def configure_ec2_instance(
             exit_status = stdout.channel.recv_exit_status()
 
             if exit_status == 0:
+                output = stdout.read().decode()
+                if output.strip():
+                    print(output)
                 break
             else:
                 error_message = stderr.read().decode()
@@ -320,29 +372,45 @@ def configure_ec2_instance(
     return instance_id, instance_ip
 
 
-def execute_command(ssh_client: paramiko.SSHClient, command: str) -> None:
-    """Execute command and stream output."""
-    print(f"Executing: {command[:80]}...")
-    stdin, stdout, stderr = ssh_client.exec_command(
-        command, timeout=config.COMMAND_TIMEOUT
-    )
+def execute_command(ssh_client: paramiko.SSHClient, command: str, idle_timeout: int = 3600) -> None:
+    """Execute command and stream output with heartbeat and idle timeout."""
+    print(f"Executing: {command[:80]}...", flush=True)
+    # get_pty=True allocates a pseudo-terminal on the remote side, which forces
+    # programs (including docker build) to use line-buffering instead of
+    # block-buffering — so output appears in real time rather than at the end.
+    # With a pty, stderr is merged into stdout as it would be in a real terminal.
+    stdin, stdout, stderr = ssh_client.exec_command(command, timeout=None, get_pty=True)
+
+    last_output = time.time()
+    last_heartbeat = time.time()
+    heartbeat_interval = 60
 
     while not stdout.channel.exit_status_ready():
         if stdout.channel.recv_ready():
-            line = stdout.channel.recv(1024).decode("utf-8", errors="replace")
-            if line.strip():
-                print(line.strip())
+            chunk = stdout.channel.recv(65535).decode("utf-8", errors="replace")
+            chunk = _ANSI_ESCAPE.sub("", chunk).replace("\r\n", "\n").replace("\r", "\n")
+            if chunk:
+                print(chunk, end="", flush=True)
+                last_output = time.time()
+                last_heartbeat = time.time()
+
+        now = time.time()
+        if now - last_output > idle_timeout:
+            raise RuntimeError(f"Command idle for {idle_timeout}s with no output, aborting")
+        if now - last_heartbeat > heartbeat_interval:
+            print(f"[still running, no output for {int(now - last_output)}s...]", flush=True)
+            last_heartbeat = now
+
+        time.sleep(0.1)
 
     exit_status = stdout.channel.recv_exit_status()
 
     remaining = stdout.read().decode("utf-8", errors="replace")
-    if remaining.strip():
-        print(remaining.strip())
+    remaining = _ANSI_ESCAPE.sub("", remaining).replace("\r\n", "\n").replace("\r", "\n")
+    if remaining:
+        print(remaining, end="", flush=True)
 
     if exit_status != 0:
-        error = stderr.read().decode("utf-8", errors="replace")
-        if error.strip():
-            print(f"Error: {error.strip()}")
         raise RuntimeError(f"Command failed with status {exit_status}")
 
 
@@ -621,10 +689,14 @@ class Deploy:
 
     @staticmethod
     def start() -> str:
-        """Deploy OmniParser and return server URL.
+        """Deploy OmniParser and return the local server URL.
+
+        The API port is only reachable through an SSH tunnel
+        (``python -m openadapt_grounding.deploy tunnel``).
 
         Returns:
-            Server URL (e.g., "http://1.2.3.4:8000")
+            Local URL of the server once the tunnel is open
+            (e.g., "http://localhost:8000")
         """
         try:
             instance_id, instance_ip = configure_ec2_instance()
@@ -665,11 +737,10 @@ class Deploy:
                     pkey=key,
                     timeout=30,
                 )
+                ssh_client.get_transport().set_keepalive(30)
 
                 setup_commands = [
-                    "rm -rf OmniParser",
-                    f"git clone {config.REPO_URL}",
-                    "cp Dockerfile .dockerignore OmniParser/",
+                    f"sudo docker image inspect {config.PROJECT_NAME} > /dev/null 2>&1 || (rm -rf OmniParser && git clone {config.REPO_URL} && cp Dockerfile .dockerignore OmniParser/)",
                 ]
 
                 for cmd in setup_commands:
@@ -677,8 +748,7 @@ class Deploy:
 
                 docker_commands = [
                     f"sudo docker rm -f {config.CONTAINER_NAME} || true",
-                    f"sudo docker rmi {config.PROJECT_NAME} || true",
-                    f"cd OmniParser && sudo docker build --progress=plain -t {config.PROJECT_NAME} .",
+                    f"sudo docker image inspect {config.PROJECT_NAME} > /dev/null 2>&1 || (cd OmniParser && sudo docker build --progress=plain -t {config.PROJECT_NAME} .)",
                     f"sudo docker run -d -p {config.PORT}:{config.PORT} --gpus all --name {config.CONTAINER_NAME} {config.PROJECT_NAME}",
                 ]
 
@@ -701,9 +771,11 @@ class Deploy:
                         else:
                             raise RuntimeError("Server failed to start")
 
-                server_url = f"http://{instance_ip}:{config.PORT}"
-                print(f"\nDeployment complete!")
-                print(f"Server URL: {server_url}")
+                server_url = f"http://localhost:{config.PORT}"
+                print("\nDeployment complete!")
+                print("The API is not publicly exposed. Open an SSH tunnel with:")
+                print("  python -m openadapt_grounding.deploy tunnel")
+                print(f"Then use: {server_url}")
 
                 # Set up auto-shutdown to save costs
                 create_auto_shutdown_infrastructure(instance_id)
@@ -732,8 +804,9 @@ class Deploy:
             found = True
             ip = instance.public_ip_address
             if ip:
-                url = f"http://{ip}:{config.PORT}"
-                print(f"Instance: {instance.id} | State: {instance.state['Name']} | URL: {url}")
+                print(f"Instance: {instance.id} | State: {instance.state['Name']} | IP: {ip}")
+                print(f"SSH tunnel: ssh -L {config.PORT}:localhost:{config.PORT} -i {config.AWS_EC2_KEY_PATH} -N -o StrictHostKeyChecking=no {config.AWS_EC2_USER}@{ip}")
+                print(f"Then use:   http://localhost:{config.PORT}")
             else:
                 print(f"Instance: {instance.id} | State: {instance.state['Name']} | No public IP")
 
@@ -777,11 +850,11 @@ class Deploy:
             subprocess.run(
                 [
                     "ssh",
+                    "-tt",
                     "-o", "StrictHostKeyChecking=no",
                     "-o", "UserKnownHostsFile=/dev/null",
                     "-i", config.AWS_EC2_KEY_PATH,
                     f"{config.AWS_EC2_USER}@{ip}",
-                    "-t", "-tt",
                     "bash --login -c 'exit'",
                 ],
                 check=False,
@@ -821,6 +894,26 @@ class Deploy:
                 print(f"Error deleting security group: {e}")
 
     @staticmethod
+    def pause() -> None:
+        """Stop (but don't terminate) the running instance."""
+        ec2_client = boto3.client("ec2", region_name=config.AWS_REGION)
+        ec2 = boto3.resource("ec2", region_name=config.AWS_REGION)
+        instances = ec2.instances.filter(
+            Filters=[
+                {"Name": "tag:Name", "Values": [config.PROJECT_NAME]},
+                {"Name": "instance-state-name", "Values": ["running"]},
+            ]
+        )
+        instance = next(iter(instances), None)
+        if not instance:
+            print("No running instance found")
+            return
+        print(f"Stopping: {instance.id}")
+        ec2_client.stop_instances(InstanceIds=[instance.id])
+        instance.wait_until_stopped()
+        print(f"Stopped: {instance.id}")
+
+    @staticmethod
     def _get_instance_ip() -> Optional[str]:
         """Get public IP of running instance."""
         ec2 = boto3.resource("ec2", region_name=config.AWS_REGION)
@@ -856,6 +949,8 @@ class Deploy:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         if result.returncode != 0 and result.stderr:
@@ -871,10 +966,10 @@ class Deploy:
         """
         print(f"Fetching last {lines} lines of container logs...")
         output = Deploy._run_ssh_command(
-            f"sudo docker logs {config.CONTAINER_NAME} 2>&1 | tail -{lines}"
+            f"sudo docker logs --timestamps {config.CONTAINER_NAME} 2>&1 | tail -{lines}"
         )
         if output:
-            print(output)
+            print(_localize_timestamps(output))
 
     @staticmethod
     def ps() -> None:
@@ -935,17 +1030,32 @@ class Deploy:
         Deploy.ps()
 
     @staticmethod
-    def test(save_output: bool = False) -> None:
+    def test(save_output: bool = False, url: Optional[str] = None) -> None:
         """Test OmniParser endpoint with a synthetic image.
+
+        The API port is not publicly reachable, so by default a temporary SSH
+        tunnel to the running instance is opened for the duration of the test.
 
         Args:
             save_output: If True, save test image and results to assets/
+            url: Server URL to test instead (e.g. an already open tunnel,
+                "http://localhost:8000").
         """
-        ip = Deploy._get_instance_ip()
-        if not ip:
+        if url:
+            Deploy._test_endpoint(url, save_output)
             return
 
-        url = f"http://{ip}:{config.PORT}"
+        try:
+            tunnel = Deploy.tunnel(local_port=_free_local_port())
+        except RuntimeError as e:
+            print(f"Could not open SSH tunnel: {e}")
+            return
+        with tunnel as tunnel_url:
+            Deploy._test_endpoint(tunnel_url, save_output)
+
+    @staticmethod
+    def _test_endpoint(url: str, save_output: bool) -> None:
+        """Health-check ``url`` and parse a synthetic UI image with it."""
         print(f"Testing endpoint: {url}")
 
         # Check health first
@@ -1049,13 +1159,161 @@ class Deploy:
             print(f"Test failed: {e}")
 
 
+    @staticmethod
+    def secure() -> None:
+        """Remove public API port from the security group.
+
+        After running this, the API is only reachable via SSH tunnel.
+        Run once against an existing deployment to close the open port.
+        """
+        ec2 = boto3.client("ec2", region_name=config.AWS_REGION)
+        try:
+            response = ec2.describe_security_groups(
+                GroupNames=[config.AWS_EC2_SECURITY_GROUP]
+            )
+            sg_id = response["SecurityGroups"][0]["GroupId"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "InvalidGroup.NotFound":
+                print(f"Security group '{config.AWS_EC2_SECURITY_GROUP}' not found — nothing to do")
+                return
+            raise
+
+        try:
+            ec2.revoke_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{
+                    "IpProtocol": "tcp",
+                    "FromPort": config.PORT,
+                    "ToPort": config.PORT,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                }],
+            )
+            print(f"Removed public access on port {config.PORT} from security group {sg_id}")
+            print("API is now accessible only via SSH tunnel.")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "InvalidPermission.NotFound":
+                print(f"Port {config.PORT} was not publicly open — already secure")
+            else:
+                raise
+
+    @staticmethod
+    def tunnel(local_port: Optional[int] = None, timeout: int = 15, block: bool = False) -> Optional["TunnelProcess"]:
+        """Start an SSH tunnel to the running instance.
+
+        Forwards local_port -> localhost:{config.PORT} on the remote instance
+        through SSH (port 22), so the API is reachable at http://localhost:{local_port}
+        without exposing port {config.PORT} publicly.
+
+        CLI usage (blocks until Ctrl+C):
+            python -m openadapt_grounding.deploy tunnel
+
+        Python usage (returns TunnelProcess to manage lifecycle):
+            with Deploy.tunnel(block=False) as url:
+                client = OmniParserClient(url)
+                ...
+
+            proc = Deploy.tunnel(block=False)
+            client = OmniParserClient(proc.local_url)
+            ...
+            proc.stop()
+
+        Args:
+            local_port: Local port to bind (defaults to config.PORT)
+            timeout: Seconds to wait for tunnel to become ready
+            block: If False (default), return TunnelProcess — for programmatic use.
+                   If True, block until Ctrl+C — for CLI use.
+        """
+        if local_port is None:
+            local_port = config.PORT
+
+        ip = Deploy._get_instance_ip()
+        if not ip:
+            raise RuntimeError("No running instance found")
+        if not os.path.exists(config.AWS_EC2_KEY_PATH):
+            raise RuntimeError(f"Key file not found: {config.AWS_EC2_KEY_PATH}")
+
+        cmd = [
+            "ssh",
+            "-L", f"{local_port}:localhost:{config.PORT}",
+            "-i", config.AWS_EC2_KEY_PATH,
+            "-N",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ExitOnForwardFailure=yes",
+            f"{config.AWS_EC2_USER}@{ip}",
+        ]
+
+        print(f"Opening SSH tunnel: localhost:{local_port} -> {ip}:{config.PORT}")
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Wait for local port to become available
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("SSH tunnel process exited unexpectedly")
+            try:
+                with socket.create_connection(("localhost", local_port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            process.terminate()
+            raise RuntimeError(f"Tunnel not ready after {timeout}s")
+
+        local_url = f"http://localhost:{local_port}"
+        print(f"Tunnel ready: {local_url}")
+        print(f"Use: OmniParserClient('{local_url}')")
+
+        if block:
+            print("Press Ctrl+C to close the tunnel.")
+            try:
+                process.wait()
+            except KeyboardInterrupt:
+                process.terminate()
+                process.wait()
+                print("\nSSH tunnel closed")
+            return None
+
+        return TunnelProcess(process, local_url)
+
+
+class TunnelProcess:
+    """Handle for a running SSH tunnel. Use as a context manager or call stop()."""
+
+    def __init__(self, process: subprocess.Popen, local_url: str):
+        self.process = process
+        self.local_url = local_url
+
+    def stop(self) -> None:
+        """Terminate the SSH tunnel."""
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait()
+            print("SSH tunnel closed")
+
+    def __enter__(self) -> str:
+        return self.local_url
+
+    def __exit__(self, *args) -> None:
+        self.stop()
+
+
+class _DeployCLI(Deploy):
+    """Deploy commands as exposed on the command line."""
+
+    @staticmethod
+    def tunnel(local_port: Optional[int] = None, timeout: int = 15) -> None:
+        """Open an SSH tunnel to the instance and keep it open until Ctrl+C."""
+        Deploy.tunnel(local_port=local_port, timeout=timeout, block=True)
+
+
 def main():
     """CLI entry point."""
     try:
         import fire
     except ImportError:
         raise ImportError("fire not installed. Run: uv pip install openadapt-grounding[deploy]")
-    fire.Fire(Deploy)
+    fire.Fire(_DeployCLI)
 
 
 if __name__ == "__main__":
